@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "chronosd",
+    "chronos-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Joaquín Escalante (https://github.com/joaquinescalante23)"]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Async Runtime
+tokio = { version = "1.36", features = ["full"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+
+# gRPC & Proto
+tonic = "0.11"
+prost = "0.12"
+tower = "0.4"
+
+# Persistence
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "sqlite", "uuid", "chrono"] }
+
+# Serialization & Utils
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11", features = ["json"] }
+uuid = { version = "1.7", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive", "env"] }
