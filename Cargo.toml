@@ -2,6 +2,7 @@
 members = [
     "chronosd",
     "chronos-cli",
+    "aether-tui",
 ]
 resolver = "2"
 
