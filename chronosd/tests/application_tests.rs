@@ -37,7 +37,7 @@ mod tests {
         let (repo, _, cognitive_loop) = setup_test_env().await;
         let orchestrator = Orchestrator::new(repo.clone(), cognitive_loop);
 
-        let mission_id = orchestrator
+        let _mission_id = orchestrator
             .start_dev_mission("Test Mission".to_string(), "Build a test".to_string())
             .await
             .expect("Should start mission");

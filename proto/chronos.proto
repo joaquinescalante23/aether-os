@@ -16,6 +16,9 @@ service ChronosKernel {
     rpc PauseAgent (PauseAgentRequest) returns (PauseAgentResponse);
     rpc ResumeAgent (ResumeAgentRequest) returns (ResumeAgentResponse);
 
+    // Command Interface
+    rpc SendCommand (SendCommandRequest) returns (SendCommandResponse);
+
     // Monitoring & Inspection
     rpc ListAgents (ListAgentsRequest) returns (ListAgentsResponse);
     rpc InspectAgent (InspectAgentRequest) returns (InspectAgentResponse);
@@ -63,6 +66,15 @@ message ResumeAgentRequest {
 message ResumeAgentResponse {
     string agent_id = 1;
     AgentState state = 2;
+}
+
+message SendCommandRequest {
+    string agent_id = 1;
+    string content = 2;
+}
+
+message SendCommandResponse {
+    bool success = 1;
 }
 
 // --- Monitoring Requests & Responses ---

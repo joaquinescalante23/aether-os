@@ -193,6 +193,31 @@ impl ChronosKernel for ChronosServer {
         }))
     }
 
+    async fn send_command(
+        &self,
+        request: Request<SendCommandRequest>,
+    ) -> Result<Response<SendCommandResponse>, Status> {
+        let req = request.into_inner();
+        let agent_id = Uuid::parse_str(&req.agent_id)
+            .map_err(|_| Status::invalid_argument("Invalid Agent ID"))?;
+
+        let mut latest_checkpoint = self.repository.get_latest_checkpoint(agent_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        latest_checkpoint.messages.push(crate::domain::checkpoint::Message {
+            role: crate::domain::checkpoint::MessageRole::User,
+            content: req.content,
+            timestamp: chrono::Utc::now(),
+        });
+
+        self.repository.save_checkpoint(&latest_checkpoint)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(SendCommandResponse { success: true }))
+    }
+
     async fn inspect_agent(
         &self,
         _request: Request<InspectAgentRequest>,
