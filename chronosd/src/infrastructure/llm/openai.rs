@@ -100,7 +100,7 @@ impl LlmProvider for GenericOpenAiProvider {
         let body: ChatResponse = response.json().await
             .map_err(|e| DomainError::Internal(format!("Failed to parse response: {}", e)))?;
 
-        let choice = body.choices.get(0)
+        let choice = body.choices.first()
             .ok_or_else(|| DomainError::Internal("No choices returned from LLM".to_string()))?;
 
         let content = choice.message.content.clone()

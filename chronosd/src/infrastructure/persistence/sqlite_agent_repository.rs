@@ -57,7 +57,7 @@ impl SqliteAgentRepository {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| DomainError::PersistenceError(id, e.to_string()))?
-            .ok_or_else(|| DomainError::AgentNotFound(id))?;
+            .ok_or(DomainError::AgentNotFound(id))?;
 
         let state_str: String = row.get("state");
         let state = match state_str.as_str() {
@@ -120,6 +120,32 @@ impl SqliteAgentRepository {
             });
         }
         Ok(agents)
+    }
+
+    /// Retrieves the most recent cognitive checkpoint for an agent.
+    pub async fn get_latest_checkpoint(&self, agent_id: Uuid) -> DomainResult<Checkpoint> {
+        let row = sqlx::query(r#"SELECT * FROM checkpoints WHERE agent_id = ? ORDER BY created_at DESC LIMIT 1"#)
+            .bind(agent_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DomainError::PersistenceError(agent_id, e.to_string()))?
+            .ok_or_else(|| DomainError::Internal(format!("No checkpoints found for agent {}", agent_id)))?;
+
+        let messages_json: String = row.get("messages_json");
+        let tools_json: String = row.get("tools_json");
+
+        let messages = serde_json::from_str(&messages_json)
+            .map_err(|e| DomainError::Internal(format!("Failed to parse messages: {}", e)))?;
+        let tools = serde_json::from_str(&tools_json)
+            .map_err(|e| DomainError::Internal(format!("Failed to parse tools: {}", e)))?;
+
+        Ok(Checkpoint {
+            id: Uuid::parse_str(row.get("id")).unwrap_or_default(),
+            agent_id,
+            messages,
+            tools,
+            created_at: row.get("created_at"),
+        })
     }
 
     /// Persists a new cognitive checkpoint (Thought Snapshot).

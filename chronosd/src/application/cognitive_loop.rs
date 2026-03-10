@@ -4,7 +4,7 @@
 
 use crate::domain::agent::AgentState;
 use crate::domain::checkpoint::{Checkpoint, Message, MessageRole};
-use crate::domain::error::{DomainError, DomainResult};
+use crate::domain::error::DomainResult;
 use crate::domain::{LlmProvider, ToolRegistry};
 use crate::infrastructure::SqliteAgentRepository;
 use std::sync::Arc;
@@ -31,70 +31,114 @@ impl CognitiveLoop {
         }
     }
 
-    /// Runs a single step of the agent's thought process.
-    pub async fn run_step(&self, agent_id: Uuid) -> DomainResult<()> {
-        info!("CognitiveLoop: Running step for agent {}", agent_id);
-
+    /// Runs a single step of the agent's thought process. Returns true if active work was done.
+    pub async fn run_step(&self, agent_id: Uuid) -> DomainResult<bool> {
         let mut agent = self.repository.find_agent(agent_id).await?;
         if agent.state != AgentState::Running {
-            return Err(DomainError::InvalidStateTransition(agent_id, "Agent is not in Running state".to_string()));
+            return Ok(false);
         }
 
-        // Fetch schema from registry to instruct the LLM
-        let registry = self.tool_registry.read().await;
-        let tools_schema = registry.combined_schema();
-
-        let messages = vec![
-            Message {
-                role: MessageRole::System,
-                content: format!("You are a Chronos Agent. You have access to the following tools: {}. If you need to perform an action, output a JSON object with 'tool_call' containing 'tool_name' and 'arguments'.", tools_schema),
-                timestamp: Utc::now(),
-            },
-            Message {
-                role: MessageRole::User,
-                content: format!("Continue your work for agent {}", agent.name),
-                timestamp: Utc::now(),
+        // 1. Fetch History or create Genesis Checkpoint
+        let mut checkpoint = match self.repository.get_latest_checkpoint(agent_id).await {
+            Ok(cp) => cp,
+            Err(_) => {
+                info!("CognitiveLoop: Initializing Genesis Checkpoint for {}", agent.id);
+                let registry = self.tool_registry.read().await;
+                let tools_schema = registry.combined_schema();
+                let initial_messages = vec![
+                    Message {
+                        role: MessageRole::System,
+                        content: format!("You are AetherOS Agent '{}'.\n\nYou have access to the following tools:\n{}\n\nTo execute a tool, you MUST reply with a JSON block in this exact format:\n```json\n{{\"tool_call\": {{\"tool_name\": \"name\", \"arguments\": {{\"key\": \"value\"}}}}}}\n```\nIf you do not need to use a tool, just reply normally.", agent.name, tools_schema),
+                        timestamp: Utc::now(),
+                    },
+                    Message {
+                        role: MessageRole::User,
+                        content: "System boot complete. Awaiting instructions.".to_string(),
+                        timestamp: Utc::now(),
+                    }
+                ];
+                let cp = Checkpoint::new(agent.id, initial_messages, vec![]);
+                self.repository.save_checkpoint(&cp).await?;
+                cp
             }
-        ];
+        };
 
-        let response = self.llm_provider.completion(&agent.model_id, &messages).await?;
+        // 2. Idle Check: If the last message was from the assistant and wasn't a tool call, wait for user input.
+        if let Some(last_msg) = checkpoint.messages.last() {
+            if last_msg.role == MessageRole::Assistant {
+                return Ok(false); // Idle
+            }
+        }
+
+        info!("CognitiveLoop: Processing thought for agent {}", agent_id);
+
+        // 3. Call LLM with full context
+        let response = self.llm_provider.completion(&agent.model_id, &checkpoint.messages).await?;
         agent.budget.consume(agent.id, response.prompt_tokens + response.completion_tokens, response.total_cost_usd)?;
 
-        // Simple heuristic for parsing tool calls in MVP
-        let mut new_messages = messages.clone();
+        let mut executed_tool = false;
+        let content = response.content.clone();
         
-        if response.content.contains("\"tool_call\"") {
-            // Simulated tool execution
-            info!("Agent {} requested a tool call.", agent.id);
-            // In a real implementation, we would parse the JSON, call registry.get("tool_name").execute(),
-            // and append the ToolResult. For MVP, we simulate the observation.
-            
-            new_messages.push(Message {
-                role: MessageRole::Assistant,
-                content: response.content.clone(),
-                timestamp: Utc::now(),
-            });
+        checkpoint.messages.push(Message {
+            role: MessageRole::Assistant,
+            content: content.clone(),
+            timestamp: Utc::now(),
+        });
 
-            new_messages.push(Message {
-                role: MessageRole::Tool,
-                content: "Tool executed successfully.".to_string(),
-                timestamp: Utc::now(),
-            });
-            
+        // 4. Robust JSON Parsing for Tool Calls
+        let json_str = if let Some(start) = content.find("```json") {
+            if let Some(end) = content[start + 7..].find("```") {
+                &content[start + 7..start + 7 + end]
+            } else {
+                &content
+            }
+        } else if let Some(start) = content.find('{') {
+             if let Some(end) = content.rfind('}') {
+                 &content[start..=end]
+             } else {
+                 &content
+             }
         } else {
-            new_messages.push(Message {
-                role: MessageRole::Assistant,
-                content: response.content,
-                timestamp: Utc::now(),
-            });
+            &content
+        };
+
+        if let Ok(json_resp) = serde_json::from_str::<serde_json::Value>(json_str) {
+            if let Some(tool_call) = json_resp.get("tool_call") {
+                if let (Some(tool_name), Some(args)) = (tool_call.get("tool_name").and_then(|v| v.as_str()), tool_call.get("arguments")) {
+                    info!("Agent {} executing tool: {}", agent.id, tool_name);
+                    
+                    let registry = self.tool_registry.read().await;
+                    let result_msg = match registry.get(tool_name) {
+                        Some(tool) => match tool.execute(args.clone()).await {
+                            Ok(res) => {
+                                if res.is_error {
+                                    format!("Tool Execution Failed:\n{}", res.result)
+                                } else {
+                                    format!("Tool Execution Success:\n{}", res.result)
+                                }
+                            }
+                            Err(e) => format!("Kernel Error executing tool: {}", e),
+                        },
+                        None => format!("Error: Tool '{}' not found in registry.", tool_name),
+                    };
+
+                    checkpoint.messages.push(Message {
+                        role: MessageRole::Tool,
+                        content: result_msg,
+                        timestamp: Utc::now(),
+                    });
+                    
+                    executed_tool = true;
+                }
+            }
         }
 
-        let checkpoint = Checkpoint::new(agent.id, new_messages, vec![]);
-        
+        // 5. Persist State
+        let new_checkpoint = Checkpoint::new(agent.id, checkpoint.messages, vec![]);
         self.repository.save_agent(&agent).await?;
-        self.repository.save_checkpoint(&checkpoint).await?;
+        self.repository.save_checkpoint(&new_checkpoint).await?;
 
-        Ok(())
+        Ok(executed_tool)
     }
 
     /// Background task that keeps the agent running until paused or terminated.
@@ -102,7 +146,6 @@ impl CognitiveLoop {
         info!("CognitiveLoop: Starting background process for agent {}", agent_id);
         
         loop {
-            // Check if agent is still in Running state
             let agent = match self.repository.find_agent(agent_id).await {
                 Ok(a) => a,
                 Err(e) => {
@@ -112,23 +155,30 @@ impl CognitiveLoop {
             };
 
             if agent.state != AgentState::Running {
-                info!("CognitiveLoop: Agent {} no longer running. Stopping loop.", agent_id);
                 break;
             }
 
-            // Run a cognitive step
-            if let Err(e) = self.run_step(agent_id).await {
-                error!("CognitiveLoop: Critical error in agent {}: {}", agent_id, e);
-                // Mark agent as Error in DB
-                let mut agent = agent;
-                agent.fail();
-                let _ = self.repository.save_agent(&agent).await;
-                break;
-            }
+            let did_work = match self.run_step(agent_id).await {
+                Ok(work) => work,
+                Err(e) => {
+                    error!("CognitiveLoop: Critical error in agent {}: {}", agent_id, e);
+                    let mut agent = agent;
+                    agent.fail();
+                    let _ = self.repository.save_agent(&agent).await;
+                    break;
+                }
+            };
 
-            // Throttle to avoid CPU/Token exhaustion in MVP
-            sleep(Duration::from_secs(5)).await;
+            if did_work {
+                // If a tool was executed, immediately process the next thought
+                tokio::task::yield_now().await;
+            } else {
+                // If idle or waiting for user input, sleep to save CPU
+                sleep(Duration::from_millis(1000)).await;
+            }
         }
+        
+        info!("CognitiveLoop: Halted for agent {}", agent_id);
     }
 }
 
